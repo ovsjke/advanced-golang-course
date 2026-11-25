@@ -7,6 +7,11 @@
 // disagree, this file wins; the grader is written against it.
 package broadcaster
 
+import (
+	"context"
+	"sync"
+)
+
 // Policy is what Publish does about a subscriber that has fallen behind (see
 // Subscribe for when that is). Each policy's promise to a subscriber that
 // stops reading is stated below; the grader checks exactly these.
@@ -34,7 +39,20 @@ const (
 // and the slow subscriber itself, and why that is the right trade. The grader
 // tests the policy declared here.
 //
-// TODO: choose, and defend.
+// Выбрал такую политику, так как посчитал ее реализацию наиболее интересной
+// По сути политика реализует жертву пропускной способностью, т.к. мы не прерывваем поставку сообщения,
+// пока не придет команда отписки или закрытия бродкастера. Но взамен мы получаем гарантию доставки публикации.
+
+// Каждая операция блокирует мьютексом разделяемый контекст, пока есть вероятность гонки. 
+// Под мьютексами мы проверяем состояние контекста (bool), что гарантирует его актуальность на момент проверки
+
+// Все решения в общем позволяют гарантировать доставку сообщения, вместе с тем, что сообщения получат именно те пользователи, 
+// кто на момент его публикации имеет на него права.
+
+// Текущую реализацию считаю рабочей, а компромиссы в виде пропускной способности и скорости обработки сообщений обусловены тем,
+// что нам необходимо гарантировать доставку. И в таком решение ее цена такова.
+
+
 const SlowSubscriber = Block
 
 // Broadcaster fans messages out from one publisher to any number of
@@ -44,15 +62,29 @@ const SlowSubscriber = Block
 // concurrently with each other, and Publish is never called after Close.
 // Subscribe, and Unsubscribe and C on a Subscription, may be called from any
 // goroutine at any time, concurrently with each other and with Publish.
-type Broadcaster[T any] struct{}
+type Broadcaster[T any] struct {
+	mu          sync.Mutex
+	active      bool
+	subscribers map[*Subscription[T]]struct{}
+}
 
 // Subscription is one subscriber's view of a Broadcaster. Add the fields you
 // need.
-type Subscription[T any] struct{}
+type Subscription[T any] struct {
+	ctx       context.Context
+	mu        sync.Mutex
+	active    bool
+	cancel    context.CancelFunc
+	channel   chan T
+	broadcast *Broadcaster[T]
+}
 
 // New returns a Broadcaster with no subscribers.
 func New[T any]() *Broadcaster[T] {
-	panic("broadcaster: New is not implemented")
+	return &Broadcaster[T]{
+		subscribers: make(map[*Subscription[T]]struct{}),
+		active:      true,
+	}
 }
 
 // Subscribe adds a subscriber whose buffer holds buffer undelivered messages.
@@ -79,7 +111,28 @@ func New[T any]() *Broadcaster[T] {
 //     calls in a row: they must never wait for a blocked Publish.
 //   - After Close, Subscribe returns a subscription whose channel is closed.
 func (b *Broadcaster[T]) Subscribe(buffer int) *Subscription[T] {
-	panic("broadcaster: Subscribe is not implemented")
+	if buffer < 1 {
+		panic("buffer < 1")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan T, buffer)
+	sub := &Subscription[T]{
+		ctx:       ctx,
+		active:    true,
+		cancel:    cancel,
+		channel:   ch,
+		broadcast: b,
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.active {
+		close(sub.channel)
+		sub.cancel()
+		sub.active = false
+		return sub
+	}
+	b.subscribers[sub] = struct{}{}
+	return sub
 }
 
 // C returns the channel the subscription receives on; the same channel on
@@ -87,7 +140,7 @@ func (b *Broadcaster[T]) Subscribe(buffer int) *Subscription[T] {
 // Close, or by the Disconnect policy. Messages already buffered in it may
 // still be received after it is closed.
 func (s *Subscription[T]) C() <-chan T {
-	panic("broadcaster: C is not implemented")
+	return s.channel
 }
 
 // Unsubscribe ends the subscription. It is safe to call from any goroutine,
@@ -99,7 +152,17 @@ func (s *Subscription[T]) C() <-chan T {
 //     any other, and never waits for a blocked Publish; a Publish blocked on
 //     this subscriber then proceeds. The grader allows 100 ms.
 func (s *Subscription[T]) Unsubscribe() {
-	panic("broadcaster: Unsubscribe is not implemented")
+	s.cancel()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active {
+		return
+	}
+	s.active = false
+	close(s.channel)
+	s.broadcast.mu.Lock()
+	delete(s.broadcast.subscribers, s)
+	s.broadcast.mu.Unlock()
 }
 
 // Publish delivers v to every current subscriber, under SlowSubscriber for
@@ -113,12 +176,46 @@ func (s *Subscription[T]) Unsubscribe() {
 //   - The number of goroutines the Broadcaster runs may grow with the
 //     number of subscribers, never with the number of messages published.
 func (b *Broadcaster[T]) Publish(v T) {
-	panic("broadcaster: Publish is not implemented")
+	var wg sync.WaitGroup
+	b.mu.Lock()
+	for sub := range b.subscribers {
+		wg.Go(func() {
+			sub.mu.Lock()
+			defer sub.mu.Unlock()
+			if !sub.active {
+				return
+			}
+			select {
+			case sub.channel <- v:
+				return
+			case <-sub.ctx.Done():
+				return
+			}
+		})
+	}
+	b.mu.Unlock()
+	wg.Wait()
 }
 
 // Close ends every subscription: every C is closed when Close returns, and
 // later Subscribe calls get a closed subscription. When Close returns, no
 // goroutine the Broadcaster started is still running.
 func (b *Broadcaster[T]) Close() {
-	panic("broadcaster: Close is not implemented")
+	b.mu.Lock()
+	if !b.active {
+		b.mu.Unlock()
+		return
+	}
+	b.active = false
+	subs := make([]*Subscription[T], len(b.subscribers))
+	count := 0
+	for key := range b.subscribers {
+		subs[count] = key
+		count++
+	}
+	b.mu.Unlock()
+	for _, sub := range subs {
+		sub.Unsubscribe()
+	}
+	return
 }
